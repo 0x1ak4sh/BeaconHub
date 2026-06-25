@@ -1,5 +1,7 @@
 # Beacon Hub
 
+![BeaconHub](image.png)
+
 Beacon Hub is a virtual Wi-Fi penetration testing lab for learning and practicing wireless security in a safe local environment.
 
 It runs inside a lightweight Debian virtual machine and uses Linux wireless simulation (`mac80211_hwsim`), so you can create access points, clients, captures, and attacks without buying external Wi-Fi adapters or testing on real networks.
