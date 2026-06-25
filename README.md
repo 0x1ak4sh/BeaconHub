@@ -165,8 +165,6 @@ Beacon Hub uses a small backend stack so the lab can be controlled from the brow
 - **nginx** serves the built frontend and forwards API requests from the browser to the backend.
 - **Shell scripts** in the `scripts/` folder provide simple VM commands like `beaconhub start`, `beaconhub stop`, `beaconhub status`, and helper attack workflows.
 
-If `Uvicorn` fails to start, the backend API will not be available even if nginx is running. In that case, the web page may load, but API features will fail until the Python backend issue is fixed.
-
 ## Adapter Design
 
 Beacon Hub keeps access points, clients, and attack adapters separate so the lab stays easier to understand and more stable.
