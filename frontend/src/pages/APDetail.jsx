@@ -289,9 +289,16 @@ function APDetail() {
                   }}
                 />
               </div>
-              <div className="flex gap-4 mt-2 text-label-sm text-on-surface-variant font-mono">
+              <div className="flex gap-4 mt-2 text-label-sm text-on-surface-variant font-mono flex-wrap">
                 <span>Elapsed: {wepStatus.elapsed_seconds}s</span>
                 <span>Replays: {wepStatus.replays?.filter(r => r.running).length || 0} active</span>
+                {wepStatus.monitor_interface && <span>Monitor: {wepStatus.monitor_interface}</span>}
+                <span>
+                  Inject:{' '}
+                  <span style={{ color: wepStatus.fakeauth_running ? 'var(--secondary)' : 'var(--text-muted)' }}>
+                    {wepStatus.fakeauth_running ? 'associated' : 'traffic-only'}
+                  </span>
+                </span>
               </div>
             </div>
           )}

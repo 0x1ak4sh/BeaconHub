@@ -187,7 +187,12 @@ function Clients() {
         <div>
           <h1 className="page-title">Clients</h1>
           <p className="page-subtitle">
-            {clients.length} simulated client{clients.length !== 1 ? 's' : ''} connected
+            {(() => {
+              const online = clients.filter(c => c.connection_state === 'connected').length
+              return clients.length === 0
+                ? 'No simulated clients yet'
+                : `${clients.length} simulated client${clients.length !== 1 ? 's' : ''} · ${online} online`
+            })()}
           </p>
         </div>
         <div className="flex items-center gap-4">
@@ -566,8 +571,28 @@ function ClientCard({ client, toggling, onToggleTraffic, onSetCreds, onAction })
   const hasCreds = !!client.credentials
   const state = client.connection_state || (client.ip_address ? 'connected' : 'unknown')
   const stateOk = state === 'connected'
-  const stateWarn = ['associated_no_ip', 'authenticating', '4way_handshake', 'scanning', 'associating'].includes(state)
-  const stateError = ['wrong_password', 'supplicant_stopped'].includes(state)
+  const stateError = ['wrong_password', 'supplicant_stopped', 'disconnected', 'inactive'].includes(state)
+  // Everything that isn't a clean success or a hard failure is an in-progress
+  // step. Showing "connecting" during the normal association/DHCP window (a few
+  // seconds) is honest feedback — far better than flashing a scary "offline".
+  const stateWarn = !stateOk && !stateError
+  // Friendly, human labels instead of raw wpa_supplicant enum values.
+  const STATE_LABELS = {
+    connected: 'online',
+    associated_no_ip: 'getting IP',
+    authenticating: 'connecting',
+    associating: 'connecting',
+    associated: 'connecting',
+    scanning: 'connecting',
+    '4way_handshake': 'connecting',
+    group_handshake: 'connecting',
+    unknown: 'connecting',
+    wrong_password: 'wrong password',
+    disconnected: 'offline',
+    inactive: 'offline',
+    supplicant_stopped: 'offline',
+  }
+  const stateLabel = STATE_LABELS[state] || state.replaceAll('_', ' ')
 
   return (
     <div className="card p-4 animate-fade-in">
@@ -593,8 +618,8 @@ function ClientCard({ client, toggling, onToggleTraffic, onSetCreds, onAction })
                 traffic
               </span>
             )}
-            <span className={`badge ${stateOk ? 'badge-secondary' : stateError ? 'badge-tertiary' : 'badge-warning'}`}>
-              {state.replaceAll('_', ' ')}
+            <span className={`badge ${stateOk ? 'badge-secondary' : stateError ? 'badge-tertiary' : 'badge-warning'} ${stateWarn ? 'animate-pulse' : ''}`}>
+              {stateLabel}
             </span>
           </div>
           <div className="flex items-center gap-4 text-label-md font-mono">

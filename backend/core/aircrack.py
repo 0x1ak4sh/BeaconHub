@@ -258,6 +258,71 @@ class AircrackManager:
 
     # ── WEP ARP Replay ──────────────────────────────────────────────────
 
+    def start_fakeauth(
+        self,
+        attack_id: str,
+        interface: str,
+        target_bssid: str,
+        source_mac: str,
+        essid: Optional[str] = None,
+    ) -> AttackProcess:
+        """
+        Associate with the AP using aireplay-ng -1 (fake authentication).
+
+        WEP APs drop injected frames from stations they have not authenticated.
+        Running a periodic fake auth keeps the monitor interface associated so
+        the ARP replay's injected packets are accepted. Failure is non-fatal:
+        if a real client is already associated we can replay using its MAC.
+        """
+        if attack_id in self._attacks and self._attacks[attack_id].is_running:
+            raise AircrackError(f"Attack {attack_id} is already running")
+
+        log_file = os.path.join(RUN_DIR, f"attack_{attack_id}.log")
+
+        # "-1 30" re-authenticates every 30s to survive AP association timeouts.
+        cmd = ["aireplay-ng", "-1", "30", "-a", target_bssid, "-h", source_mac]
+        if essid:
+            cmd.extend(["-e", essid])
+        cmd.append(interface)
+
+        log_fd = None
+        try:
+            log_fd = open(log_file, "w")
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid
+            )
+            log_fd.close()
+            log_fd = None
+
+            attack = AttackProcess(attack_id, "fakeauth")
+            attack.process = process
+            attack.pid = process.pid
+            attack.log_file = log_file
+            attack.started_at = time.time()
+            attack.target_bssid = target_bssid
+            attack.interface = interface
+            self._attacks[attack_id] = attack
+
+            logger.info(
+                f"Started fake auth {attack_id}: "
+                f"target={target_bssid}, source={source_mac}, interface={interface}"
+            )
+            return attack
+
+        except FileNotFoundError:
+            if log_fd:
+                try: log_fd.close()
+                except Exception: pass
+            raise AircrackError("aireplay-ng not found. Is aircrack-ng suite installed?")
+        except Exception as e:
+            if log_fd:
+                try: log_fd.close()
+                except Exception: pass
+            raise AircrackError(f"Failed to start fake auth: {str(e)}")
+
     def start_arp_replay(
         self,
         attack_id: str,
@@ -389,39 +454,44 @@ class AircrackManager:
                 except Exception: pass
             raise AircrackError(f"Failed to start WEP capture: {str(e)}")
 
-    def get_iv_count(self, csv_file: str) -> int:
-        """Parse airodump-ng CSV to count unique IVs collected for WEP."""
+    def get_iv_count(self, capture_file: str) -> int:
+        """Count WEP IVs collected so far by reading the airodump-ng CSV.
+
+        Parsing the CSV directly is far more reliable than shelling out to
+        aircrack-ng (the old code called a non-existent ``-s`` stats mode and
+        then read the wrong CSV column). The AP row's ``# IV`` field is column
+        index 10 in airodump-ng's CSV layout.
+
+        Accepts either the ``.cap`` or ``.csv`` path; airodump-ng writes both
+        with the same ``-01`` prefix.
+        """
+        csv_file = capture_file
+        if csv_file.endswith(".cap"):
+            csv_file = csv_file[:-4] + ".csv"
         if not os.path.exists(csv_file):
             return 0
         try:
-            result = subprocess.run(
-                ["aircrack-ng", "-s", csv_file.replace("-01.csv", "-01.cap")],
-                capture_output=True, text=True, timeout=15,
-                input="q\n"
-            )
-            # aircrack-ng -s outputs: "Total number of WEP data packets: <N>"
-            for line in result.stdout.split('\n'):
-                if "WEP data packets" in line:
-                    parts = line.split(':')
-                    if len(parts) >= 2:
-                        return int(parts[1].strip())
-            return 0
-        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-            try:
-                # Fallback: parse CSV for IV count in column 7
-                with open(csv_file, 'r') as f:
-                    for line in f:
-                        if line.startswith("#") or "BSSID" in line:
+            with open(csv_file, "r", errors="ignore") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    # The station section starts with a "Station MAC" header;
+                    # everything past it is client data, not AP IV counts.
+                    if line.startswith("Station MAC"):
+                        break
+                    if line.startswith("BSSID"):
+                        continue
+                    parts = [p.strip() for p in line.split(",")]
+                    # AP rows start with a MAC and carry the '# IV' column (10).
+                    if len(parts) > 10 and re.match(r"^[0-9A-Fa-f:]{17}$", parts[0]):
+                        try:
+                            return int(parts[10])
+                        except ValueError:
                             continue
-                        parts = line.split(',')
-                        if len(parts) >= 8 and parts[0].strip():
-                            try:
-                                return int(parts[6].strip())
-                            except ValueError:
-                                continue
-                return 0
-            except Exception:
-                return 0
+            return 0
+        except Exception:
+            return 0
 
     def list_captures(self) -> List[Dict[str, str]]:
         """List all capture files (.cap and .pcapng)."""
@@ -519,28 +589,40 @@ class AircrackManager:
 
             # Check if still running
             if attack.is_running:
-                # Parse progress
-                lines = content.split('\n')
+                # aircrack-ng's live progress line looks like:
+                #   "[00:00:04] 4620/10303 keys tested (1157.02 k/s)"
+                # Scan from the end for the most recent progress and parse it
+                # with a regex so a stray token can't crash the whole call.
                 tested = 0
                 total = 0
-                for line in lines:
-                    if "Testing" in line and "keys" in line:
-                        # "Testing 1234 keys - got 0 PMKs"
-                        parts = line.split()
-                        for i, p in enumerate(parts):
-                            if p == "Testing" and i + 1 < len(parts):
-                                tested = int(parts[i + 1])
-                            if "of" in parts and i + 1 < len(parts) and parts[i + 1].isdigit():
-                                total = int(parts[i + 1])
-                    elif "Reading words" in line or "Read" in line:
-                        pass
+                speed = None
+                for line in reversed(content.split('\n')):
+                    m = re.search(
+                        r'(\d[\d,]*)\s*/\s*(\d[\d,]*)\s+keys\s+tested', line
+                    )
+                    if m:
+                        tested = int(m.group(1).replace(',', ''))
+                        total = int(m.group(2).replace(',', ''))
+                        sm = re.search(r'\(\s*([\d.]+)\s*k/s\s*\)', line)
+                        if sm:
+                            speed = float(sm.group(1))
+                        break
+                    m2 = re.search(r'[Tt]ested\s+(\d[\d,]*)\s+keys', line)
+                    if m2:
+                        tested = int(m2.group(1).replace(',', ''))
+                        break
 
-                return {
+                msg = f"Testing keys... ({tested:,}"
+                msg += f"/{total:,} tested)" if total else " tested)"
+                result = {
                     "status": "running",
                     "tested": tested,
                     "total": total,
-                    "message": f"Testing keys... ({tested} tested)"
+                    "message": msg,
                 }
+                if speed is not None:
+                    result["speed_kps"] = speed
+                return result
 
             # Process finished - check result
             if "KEY FOUND!" in content:

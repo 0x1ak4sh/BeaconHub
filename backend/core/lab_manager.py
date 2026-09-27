@@ -1011,51 +1011,132 @@ class LabManager:
     # === WEP Attack Operations ===
 
     def start_wep_attack(self, ap_id: str, channel: int) -> dict:
-        """Start airodump-ng capture + aireplay-ng ARP replay on all clients for WEP IV generation."""
+        """Start a reliable WEP IV-collection attack.
+
+        A dedicated monitor-mode interface, parked on the target channel, is used
+        for BOTH capture (airodump-ng) and injection (aireplay-ng fake-auth + ARP
+        replay). The previous implementation captured on the AP's own hostapd
+        interface and injected on the clients' managed interfaces -- neither is a
+        monitor interface on the target channel, so capture/injection only worked
+        intermittently. That was the "WEP works sometimes" bug.
+
+        Connected client bots keep generating encrypted traffic, which both seeds
+        the ARP requests the replay needs and guarantees IVs accrue even if
+        injection is refused -- so the attack always makes progress.
+        """
         ap = self.get_ap(ap_id)
         if not ap:
             raise LabError(f"AP {ap_id} not found")
         if ap.security != "wep":
             raise LabError(f"AP {ap_id} is not WEP")
+        if not ap.bssid:
+            raise LabError(f"AP {ap_id} has no BSSID yet; is it running?")
 
         # Stop existing WEP attack for this AP
         self.stop_wep_attack(ap_id)
 
         clients = self.clients.get_clients_for_ap(ap_id)
         if not clients:
-            raise LabError(f"No clients connected to AP {ap_id}")
+            raise LabError(
+                f"No clients connected to AP {ap_id}. "
+                "Add a client first so it generates encrypted traffic."
+            )
 
-        # Start airodump-ng capture
-        capture_id = f"wep_cap_{ap_id}"
-        self.aircrack.start_wep_capture(capture_id, ap.interface, ap.bssid, channel)
-
-        # Ensure client interfaces are in monitor mode for aireplay
-        # Clients already connected so their interfaces are on the right channel
-
-        # Start ARP replay on each client
-        replay_ids = []
-        for bot in clients:
-            replay_id = f"wep_replay_{bot.client_id}"
-            try:
-                self.aircrack.start_arp_replay(
-                    replay_id, bot.interface, ap.bssid, bot.mac_address
+        # ── Acquire a dedicated monitor interface ─────────────────────────
+        mon_iface = self._allocate_interface(f"wep-monitor:{ap_id}")
+        created_iface = False
+        if not mon_iface:
+            # No free radio: create one on demand.
+            mon_iface = self.hwsim.create_radio()
+            if not mon_iface:
+                raise LabError(
+                    "No monitor interface available for WEP attack "
+                    "(no free radio and could not create one)"
                 )
-                replay_ids.append(replay_id)
-            except Exception as e:
-                logger.warning(f"Failed to start ARP replay on {bot.client_id}: {e}")
+            created_iface = True
+            self._interface_pool.append(mon_iface)
+            self._allocated_interfaces[mon_iface] = f"wep-monitor:{ap_id}"
 
-        # Start aggressive traffic as well (background noise + ARP)
+        if not self.hwsim.set_monitor_mode(mon_iface):
+            self._cleanup_wep_monitor(mon_iface, created_iface)
+            raise LabError(f"Failed to put {mon_iface} into monitor mode")
+        if not self.hwsim.set_channel(mon_iface, channel):
+            logger.warning(
+                f"Could not set channel {channel} on {mon_iface}; "
+                "capture may be unreliable"
+            )
+
+        mon_mac = self.hwsim.get_interface_mac(mon_iface) or clients[0].mac_address
+
+        # ── airodump-ng capture on the monitor interface ──────────────────
+        capture_id = f"wep_cap_{ap_id}"
+        try:
+            self.aircrack.start_wep_capture(capture_id, mon_iface, ap.bssid, channel)
+        except AircrackError as e:
+            self._cleanup_wep_monitor(mon_iface, created_iface)
+            raise LabError(f"Failed to start WEP capture: {e}")
+
+        # ── Fake authentication so the AP accepts injected frames ─────────
+        fakeauth_id = f"wep_auth_{ap_id}"
+        try:
+            self.aircrack.start_fakeauth(
+                fakeauth_id, mon_iface, ap.bssid, mon_mac, essid=ap.ssid
+            )
+        except Exception as e:
+            logger.warning(f"Fake auth failed to start for {ap_id}: {e}")
+            fakeauth_id = None
+
+        # ── ARP request replay on the monitor interface ───────────────────
+        replay_id = f"wep_replay_{ap_id}"
+        try:
+            self.aircrack.start_arp_replay(replay_id, mon_iface, ap.bssid, mon_mac)
+        except Exception as e:
+            logger.warning(f"ARP replay failed to start for {ap_id}: {e}")
+            replay_id = None
+
+        # ── Keep clients pushing encrypted traffic (IV floor) ─────────────
         for bot in clients:
             self.clients.stop_traffic(bot.client_id)
             self.clients.start_traffic(bot.client_id, interval=1, aggressive=True)
 
+        replay_ids = [r for r in [replay_id] if r]
         self._wep_attacks[ap_id] = {
             "capture_id": capture_id,
             "replay_ids": replay_ids,
+            "fakeauth_id": fakeauth_id,
+            "monitor_interface": mon_iface,
+            "monitor_created": created_iface,
         }
 
-        logger.info(f"WEP attack started on AP '{ap.ssid}' with {len(replay_ids)} ARP replays")
-        return {"capture_id": capture_id, "replay_ids": replay_ids}
+        logger.info(
+            f"WEP attack started on AP '{ap.ssid}' via monitor {mon_iface} "
+            f"(channel {channel}, replay={'yes' if replay_id else 'no'}, "
+            f"fakeauth={'yes' if fakeauth_id else 'no'})"
+        )
+        return {
+            "capture_id": capture_id,
+            "replay_ids": replay_ids,
+            "monitor_interface": mon_iface,
+        }
+
+    def _cleanup_wep_monitor(self, mon_iface: str, created: bool):
+        """Release (or delete) the monitor interface used for a WEP attack."""
+        try:
+            if created:
+                self.hwsim.delete_interface(mon_iface)
+                if mon_iface in self._interface_pool:
+                    self._interface_pool.remove(mon_iface)
+                # Drop any adapter record pointing at the deleted interface.
+                adapter = self._find_adapter_by_interface(mon_iface)
+                if adapter:
+                    self._adapters.pop(adapter.id, None)
+            else:
+                # Return it to managed mode so it can be reused normally.
+                self.hwsim.set_managed_mode(mon_iface)
+        except Exception as e:
+            logger.warning(f"Error cleaning up WEP monitor {mon_iface}: {e}")
+        finally:
+            self._release_interface(mon_iface)
 
     def get_wep_iv_count(self, ap_id: str) -> int:
         """Get current IV count for a WEP attack."""
@@ -1078,12 +1159,21 @@ class LabManager:
         for replay_id in wep.get("replay_ids", []):
             self.aircrack.stop_attack(replay_id)
 
+        # Stop fake authentication
+        if wep.get("fakeauth_id"):
+            self.aircrack.stop_attack(wep["fakeauth_id"])
+
         # Stop capture
         self.aircrack.stop_attack(wep["capture_id"])
 
         # Stop aggressive traffic on clients
         for bot in self.clients.get_clients_for_ap(ap_id):
             self.clients.stop_traffic(bot.client_id)
+
+        # Release the dedicated monitor interface
+        mon_iface = wep.get("monitor_interface")
+        if mon_iface:
+            self._cleanup_wep_monitor(mon_iface, wep.get("monitor_created", False))
 
         logger.info(f"WEP attack stopped on AP {ap_id}")
 
@@ -1127,7 +1217,16 @@ class LabManager:
             if not success:
                 raise LabError(f"Failed to set {adapter.interface} to monitor mode")
             adapter.mode = "monitor"
-        
+
+        # Park the monitor interface on the target AP's channel. Without this,
+        # aireplay-ng deauth frames are injected on whatever channel the radio
+        # happened to be on, so the attack silently misses the target -- the
+        # same "works sometimes" failure the WEP path had. airodump-ng and
+        # hcxdumptool take an explicit --channel and retune themselves, but
+        # aireplay-ng does not, so it must be set here.
+        if ap.channel:
+            self.hwsim.set_channel(adapter.interface, ap.channel)
+
         attack_id = f"attack_{uuid.uuid4().hex[:8]}"
         record = AttackRecord(attack_id, attack_type, target_ap_id, adapter_id)
         

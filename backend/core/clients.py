@@ -14,6 +14,8 @@ import threading
 import string
 from typing import Optional, Dict, List
 
+from .events import event_bus
+
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = "/opt/beaconhub/configs/wpa_supplicant"
@@ -140,38 +142,55 @@ class ClientManager:
             while self._reconnect_watcher_running:
                 try:
                     for client_id, bot in list(self._clients.items()):
-                        if not bot.auto_reconnect:
-                            continue
-                        
-                        # Check if wpa_supplicant is still running
+                        # ── Process died: mark it, reconnect if allowed ──
                         if bot.process and bot.process.poll() is not None:
-                            # Process died - reconnect
-                            logger.info(f"Client {client_id} ({bot.persona}) wpa_supplicant died, auto-reconnecting...")
+                            prev = bot.connection_state
+                            bot.connected = False
+                            bot.connection_state = "supplicant_stopped"
+                            bot.last_error = "wpa_supplicant is not running"
+                            if prev != "supplicant_stopped":
+                                self._emit_state_change(bot, prev, "supplicant_stopped")
+                            if bot.auto_reconnect:
+                                logger.info(
+                                    f"Client {client_id} ({bot.persona}) wpa_supplicant died, "
+                                    "auto-reconnecting..."
+                                )
+                                try:
+                                    self.reconnect(client_id)
+                                except Exception as e:
+                                    logger.error(f"Auto-reconnect failed for {client_id}: {e}")
+                            continue
+
+                        if not bot.is_running:
+                            continue
+
+                        # ── Re-evaluate the live state every tick. This is the
+                        # single source of truth for what the UI shows, so the
+                        # status self-heals: whatever the association/DHCP race
+                        # produced at spawn time, it converges to reality within
+                        # one poll instead of freezing on a stale "offline". ──
+                        prev_state = bot.connection_state
+                        if not bot.ip_address:
+                            bot.ip_address = self._get_interface_ip(bot.interface)
+                        new_state = self._refresh_connection_state(bot)
+                        if new_state != prev_state:
+                            self._emit_state_change(bot, prev_state, new_state)
+
+                        # ── Auto-reconnect on a genuine drop (e.g. after deauth) ──
+                        if bot.auto_reconnect and new_state in ("disconnected", "inactive"):
+                            logger.info(
+                                f"Client {client_id} ({bot.persona}) {new_state} (deauth?), "
+                                "auto-reconnecting..."
+                            )
                             try:
                                 self.reconnect(client_id)
-                                logger.info(f"Client {client_id} auto-reconnected successfully")
                             except Exception as e:
                                 logger.error(f"Auto-reconnect failed for {client_id}: {e}")
-                        
-                        # Also check if client lost connection (no IP or disconnected state)
-                        elif bot.is_running:
-                            # Check wpa_supplicant status
-                            try:
-                                result = subprocess.run(
-                                    ["wpa_cli", "-i", bot.interface, "status"],
-                                    capture_output=True, text=True, timeout=3
-                                )
-                                if "wpa_state=DISCONNECTED" in result.stdout or "wpa_state=INACTIVE" in result.stdout:
-                                    logger.info(f"Client {client_id} ({bot.persona}) disconnected (deauth?), auto-reconnecting...")
-                                    self.reconnect(client_id)
-                                    logger.info(f"Client {client_id} auto-reconnected (handshake regenerated)")
-                            except Exception:
-                                pass  # Ignore errors checking status
-                
+
                 except Exception as e:
                     logger.error(f"Reconnect watcher error: {e}")
-                
-                time.sleep(2)  # Check every 2 seconds for faster handshake capture after deauth
+
+                time.sleep(2)  # Check every 2 seconds for responsive status + fast reconnect
         
         self._reconnect_watcher_thread = threading.Thread(target=watcher, daemon=True, name="ClientReconnectWatcher")
         self._reconnect_watcher_thread.start()
@@ -483,6 +502,36 @@ class ClientManager:
         bot.connected = state in ("connected", "associated_no_ip")
         bot.connection_state = state
         return state
+
+    # Human-readable, level-tagged messages for the states worth surfacing.
+    # Pure-transient churn (scanning/associating flip-flop) is intentionally
+    # omitted so the event log stays informative rather than noisy.
+    _STATE_EVENTS = {
+        "connected":         ("info",    "connected"),
+        "associated_no_ip":  ("info",    "associated, waiting for DHCP"),
+        "wrong_password":    ("warning", "authentication failed — wrong password"),
+        "disconnected":      ("warning", "disconnected"),
+        "inactive":          ("warning", "connection inactive"),
+        "supplicant_stopped":("warning", "client process stopped"),
+    }
+
+    def _emit_state_change(self, bot: "ClientBot", prev: str, new: str):
+        """Broadcast a client connection-state transition to the event log/UI.
+
+        Runs from the watcher thread, so it uses the event bus's thread-safe
+        synchronous publish. This is what gives the user live feedback about
+        what each simulated client is actually doing.
+        """
+        mapping = self._STATE_EVENTS.get(new)
+        if not mapping:
+            return
+        level, phrase = mapping
+        name = bot.hostname or bot.persona or bot.client_id
+        detail = f" ({bot.ip_address})" if new == "connected" and bot.ip_address else ""
+        try:
+            event_bus.publish_sync(level, "client", f"{name} {phrase}{detail}")
+        except Exception:
+            pass
 
     def start_traffic(self, client_id: str, interval: int = 10, aggressive: bool = False) -> bool:
         """Start continuous background traffic for a client.
