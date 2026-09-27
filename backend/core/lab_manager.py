@@ -1217,7 +1217,16 @@ class LabManager:
             if not success:
                 raise LabError(f"Failed to set {adapter.interface} to monitor mode")
             adapter.mode = "monitor"
-        
+
+        # Park the monitor interface on the target AP's channel. Without this,
+        # aireplay-ng deauth frames are injected on whatever channel the radio
+        # happened to be on, so the attack silently misses the target -- the
+        # same "works sometimes" failure the WEP path had. airodump-ng and
+        # hcxdumptool take an explicit --channel and retune themselves, but
+        # aireplay-ng does not, so it must be set here.
+        if ap.channel:
+            self.hwsim.set_channel(adapter.interface, ap.channel)
+
         attack_id = f"attack_{uuid.uuid4().hex[:8]}"
         record = AttackRecord(attack_id, attack_type, target_ap_id, adapter_id)
         
