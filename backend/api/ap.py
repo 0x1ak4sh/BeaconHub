@@ -374,6 +374,9 @@ async def wep_status(request: Request, ap_id: str):
             "uptime_seconds": int(time.time() - a.started_at) if a else 0,
         })
 
+    fakeauth_id = wep.get("fakeauth_id")
+    fakeauth_attack = lab.aircrack.get_attack(fakeauth_id) if fakeauth_id else None
+
     return {
         "status": "running" if capture_attack and capture_attack.is_running else "stopped",
         "ap_id": ap_id,
@@ -384,6 +387,8 @@ async def wep_status(request: Request, ap_id: str):
         "ivs_needed": remaining,
         "elapsed_seconds": int(elapsed),
         "capture_file": capture_attack.output_file if capture_attack else None,
+        "monitor_interface": wep.get("monitor_interface"),
+        "fakeauth_running": fakeauth_attack.is_running if fakeauth_attack else False,
         "replays": replay_status,
     }
 
