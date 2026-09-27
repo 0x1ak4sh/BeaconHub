@@ -258,6 +258,71 @@ class AircrackManager:
 
     # ── WEP ARP Replay ──────────────────────────────────────────────────
 
+    def start_fakeauth(
+        self,
+        attack_id: str,
+        interface: str,
+        target_bssid: str,
+        source_mac: str,
+        essid: Optional[str] = None,
+    ) -> AttackProcess:
+        """
+        Associate with the AP using aireplay-ng -1 (fake authentication).
+
+        WEP APs drop injected frames from stations they have not authenticated.
+        Running a periodic fake auth keeps the monitor interface associated so
+        the ARP replay's injected packets are accepted. Failure is non-fatal:
+        if a real client is already associated we can replay using its MAC.
+        """
+        if attack_id in self._attacks and self._attacks[attack_id].is_running:
+            raise AircrackError(f"Attack {attack_id} is already running")
+
+        log_file = os.path.join(RUN_DIR, f"attack_{attack_id}.log")
+
+        # "-1 30" re-authenticates every 30s to survive AP association timeouts.
+        cmd = ["aireplay-ng", "-1", "30", "-a", target_bssid, "-h", source_mac]
+        if essid:
+            cmd.extend(["-e", essid])
+        cmd.append(interface)
+
+        log_fd = None
+        try:
+            log_fd = open(log_file, "w")
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid
+            )
+            log_fd.close()
+            log_fd = None
+
+            attack = AttackProcess(attack_id, "fakeauth")
+            attack.process = process
+            attack.pid = process.pid
+            attack.log_file = log_file
+            attack.started_at = time.time()
+            attack.target_bssid = target_bssid
+            attack.interface = interface
+            self._attacks[attack_id] = attack
+
+            logger.info(
+                f"Started fake auth {attack_id}: "
+                f"target={target_bssid}, source={source_mac}, interface={interface}"
+            )
+            return attack
+
+        except FileNotFoundError:
+            if log_fd:
+                try: log_fd.close()
+                except Exception: pass
+            raise AircrackError("aireplay-ng not found. Is aircrack-ng suite installed?")
+        except Exception as e:
+            if log_fd:
+                try: log_fd.close()
+                except Exception: pass
+            raise AircrackError(f"Failed to start fake auth: {str(e)}")
+
     def start_arp_replay(
         self,
         attack_id: str,

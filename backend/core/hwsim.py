@@ -246,6 +246,30 @@ class HwsimManager:
             logger.error(f"Failed to set managed mode: {e}")
             return False
 
+    def set_channel(self, interface: str, channel: int) -> bool:
+        """Tune an interface (typically monitor mode) to a specific channel.
+
+        Required for injection/capture: airodump-ng and aireplay-ng only see
+        the target AP's frames when the capturing radio is parked on the same
+        channel. Without this, capture/injection silently see nothing, which is
+        the classic cause of a WEP attack that "works sometimes".
+        """
+        try:
+            result = subprocess.run(
+                ["iw", "dev", interface, "set", "channel", str(channel)],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                logger.error(
+                    f"Failed to set channel {channel} on {interface}: {result.stderr}"
+                )
+                return False
+            logger.info(f"Set {interface} to channel {channel}")
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.error(f"Failed to set channel on {interface}: {e}")
+            return False
+
     def get_interface_mac(self, interface: str) -> Optional[str]:
         """Get MAC address of an interface."""
         try:
